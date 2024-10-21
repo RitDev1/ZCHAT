@@ -65,7 +65,7 @@ def find_abstract_end_page(reader):
             return i + 1
         elif 'resumo'in text.lower():
             return i
-
+        else: return None 
 
 def create_pdf_with_abstract_or_summary(input_path, output_directory):
     """Cria um novo PDF com o abstract ou, se necessário, um resumo."""
