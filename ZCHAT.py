@@ -9,6 +9,8 @@ from langchain.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
 from langchain.chains import LLMChain
 from langchain_core.prompts import ChatPromptTemplate
 import torch
@@ -64,11 +66,10 @@ def find_abstract_end_page(reader):
         if 'abstract' in text.lower():
             return i + 1
         elif 'resumo'in text.lower():
-            return i
+            return 
         else: return None 
 
 def create_pdf_with_abstract_or_summary(input_path, output_directory):
-    """Cria um novo PDF com o abstract ou, se necessário, um resumo."""
     try:
         reader = PdfReader(open(input_path, 'rb'))
     except Exception as e:
@@ -97,44 +98,59 @@ def create_pdf_with_abstract_or_summary(input_path, output_directory):
 
         temp_pdf_path = os.path.join(output_directory, "temp_summary.pdf")
         create_pdf_with_summary(summary, temp_pdf_path)
-
+        
         try:
             temp_reader = PdfReader(open(temp_pdf_path, 'rb'))
             writer.add_page(temp_reader.pages[0])
         except Exception as e:
-            st.warning(f"Erro ao ler o PDF temporário: {e}")
+            st.text(f"Erro ao ler o PDF temporário: {e}")
         finally:
             os.remove(temp_pdf_path)
 
     with open(output_path, 'wb') as f:
         writer.write(f)
 
-    print(f"Novo PDF criado: {output_path}")
+    st.text(f"Novo PDF criado: {output_path}")
 
 def generate_summary_llm(text):
-    """Gera um resumo utilizando uma LLM."""
     llm = Ollama(model="llama3.1")
     text_chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)]  # Divide em blocos de 4000 caracteres
     summaries = []
+    MAX_CHUNKS = 10  # Limite de chunks para processamento direto
 
-    for chunk in text_chunks:
-      if chunk == text_chunks[0]:
-          prompt = (
-              "Você está escrevendo um resumo para um documento acadêmico. "
-              "Resuma este documento sem incluir equações matemáticas, e cite o título do documento\n\n"
-              f"{chunk}"
-          )
-          summary = llm(prompt)
-          summaries.append(summary.strip())
-      else:
-          prompt = (
-              "Você está escrevendo um resumo para um documento acadêmico. "
-              "Resuma este documento sem incluir equações matemáticas."
-              f"{chunk}"
-          )
-          summary = llm(prompt)
-          summaries.append(summary.strip())
+    # Iteração sobre os chunks iniciais (primeiros 10 ou menos)
+    for i, chunk in enumerate(text_chunks[:MAX_CHUNKS]):
+        if i == 0:
+            prompt = (
+                "Você está escrevendo um resumo para um documento acadêmico. "
+                "Resuma este documento sem incluir equações matemáticas, e cite o título do documento.\n\n"
+                f"{chunk}"
+            )
+        else:
+            prompt = (
+                "Você está escrevendo um resumo para um documento acadêmico. "
+                "Resuma este documento sem incluir equações matemáticas.\n\n"
+                f"{chunk}"
+            )
+
+        summary = llm(prompt)
+        summaries.append(summary.strip())
+
+    # Caso haja mais de 10 chunks, faz um resumo adicional dos chunks excedentes
+    if len(text_chunks) > MAX_CHUNKS:
+        extra_chunks_text = "\n".join(text_chunks[MAX_CHUNKS:])  # Junta os chunks restantes
+        prompt = (
+            "Você está escrevendo um resumo para um documento acadêmico. "
+            "Resuma o conteúdo a seguir, que é uma agregação das partes restantes do documento.\n\n"
+            f"{extra_chunks_text}"
+        )
+        final_summary = llm(prompt)
+        summaries.append(final_summary.strip())
+
+    # Junta todos os resumos em uma única string e retorna
     return "\n".join(summaries)
+
+
 
 def extract_text_from_pdf(reader):
     return "".join([page.extract_text() or "" for page in reader.pages])
