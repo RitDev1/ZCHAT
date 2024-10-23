@@ -38,12 +38,40 @@ def split_text_into_chunks(text, chunk_size=5000, overlap=100):
     splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=overlap)
     return splitter.split_text(text)
 
+from langchain.prompts.chat import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
+
 def generate_summary_llm(text):
-    """Gera um resumo do PDF utilizando a chain `summarize` do LangChain."""
+    """Gera um resumo do PDF utilizando a chain `summarize` do LangChain com prompt personalizado."""
     llm = Ollama(model="llama3.1")  # Define o modelo LLM
-    chain = load_summarize_chain(llm, chain_type="map_reduce")  # Carrega a chain
-    docs = [Document(page_content=chunk) for chunk in split_text_into_chunks(text)]
-    summary = chain.run(docs)  # Executa a chain com os chunks
+
+    # Prompt para a etapa MAP (resumo de trechos)
+    map_prompt = ChatPromptTemplate.from_messages([
+        SystemMessagePromptTemplate.from_template(
+            "Você é um especialista em resumir textos acadêmicos."
+        ),
+        HumanMessagePromptTemplate.from_template(
+            "Leia o trecho abaixo e faça um resumo conciso em português, sem equações matemáticas:\n\n{text}"
+        )
+    ])
+
+    # Prompt para a etapa REDUCE (combinação dos resumos)
+    reduce_prompt = ChatPromptTemplate.from_messages([
+        SystemMessagePromptTemplate.from_template(
+            "Agora, você vai combinar os resumos em um único texto coeso."
+        ),
+        HumanMessagePromptTemplate.from_template(
+            "Aqui estão os resumos individuais:\n\n{text}\n\nPor favor, produza um resumo final em português:"
+        )
+    ])
+
+    # Carregar a chain com os prompts personalizados
+    chain = load_summarize_chain(
+        llm, 
+        chain_type="map_reduce", 
+        map_prompt=map_prompt, 
+        combine_prompt=reduce_prompt
+    )
+    summary = chain.run(text)  # Executa a chain com os chunks
     return summary
 
 def create_pdf_with_summary(summary, output_path):
