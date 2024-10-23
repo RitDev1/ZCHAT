@@ -19,10 +19,6 @@ import torch
 import time
 
 
-# Funções Auxiliares
-def check_cuda():
-    return "CUDA disponível." if torch.cuda.is_available() else "CUDA não disponível."
-
 def sanitize_filename(filename):
     """Remove caracteres especiais do nome do arquivo."""
     filename = unicodedata.normalize('NFKD', filename).encode('ASCII', 'ignore').decode('ASCII')
@@ -44,34 +40,39 @@ def generate_summary_llm(text):
     """Gera um resumo do PDF utilizando a chain `summarize` do LangChain com prompt personalizado."""
     llm = Ollama(model="llama3.1")  # Define o modelo LLM
 
-    # Prompt para a etapa MAP (resumo de trechos)
+    # Prompt personalizado para a etapa MAP (resumo de trechos)
     map_prompt = ChatPromptTemplate.from_messages([
         SystemMessagePromptTemplate.from_template(
             "Você é um especialista em resumir textos acadêmicos."
         ),
         HumanMessagePromptTemplate.from_template(
-            "Leia o trecho abaixo e faça um resumo conciso em português, sem equações matemáticas:\n\n{text}"
+            "Leia o seguinte trecho e faça um resumo conciso em português, sem equações matemáticas:\n\n{text}"
         )
     ])
 
-    # Prompt para a etapa REDUCE (combinação dos resumos)
+    # Prompt personalizado para a etapa REDUCE (combinação dos resumos)
     reduce_prompt = ChatPromptTemplate.from_messages([
         SystemMessagePromptTemplate.from_template(
-            "Agora, você vai combinar os resumos em um único texto coeso."
+            "Agora, combine os resumos em um único texto coeso."
         ),
         HumanMessagePromptTemplate.from_template(
             "Aqui estão os resumos individuais:\n\n{text}\n\nPor favor, produza um resumo final em português:"
         )
     ])
 
-    # Carregar a chain com os prompts personalizados
+    # Carrega a chain com os prompts personalizados
     chain = load_summarize_chain(
         llm, 
         chain_type="map_reduce", 
         map_prompt=map_prompt, 
         combine_prompt=reduce_prompt
     )
-    summary = chain.run(text)  # Executa a chain com os chunks
+
+    # Divide o texto em chunks e cria objetos Document para cada chunk
+    docs = [Document(page_content=chunk) for chunk in split_text_into_chunks(text)]
+
+    # Executa a chain com os chunks
+    summary = chain.run(docs)
     return summary
 
 def create_pdf_with_summary(summary, output_path):
@@ -158,9 +159,9 @@ def load_pdfs_from_directory(directory):
                 documents.append(Document(page_content=text, metadata={"source": filename}))
     return documents
 
-def chat_with_model(prompt, model_name, docs, parameter):
+def chat_with_model(prompt, model_name, docs, parameter, chunk_size,chunk_overlap):
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/paraphrase-multilingual-mpnet-base-v2")
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1024, chunk_overlap=100)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
     split_documents = text_splitter.split_documents(docs)
     vector_store = FAISS.from_documents(split_documents, embeddings)
     retriever = vector_store.as_retriever(search_kwargs={"k": parameter})
@@ -180,9 +181,6 @@ st.title("ZCHAT")
 
 input_directory = st.text_input("Diretório de entrada")
 output_directory = st.text_input("Diretório de saída")
-parameters = st.slider("Documentos recuperados", min_value=1, max_value=100)
-model_name = st.selectbox("Escolha o modelo de IA", ["llama3.1", "phi 3", "mistral"])
-prompt = st.text_area("Digite seu prompt")
 
 if st.button("Resumir PDFs"):
     if input_directory and output_directory:
@@ -190,17 +188,21 @@ if st.button("Resumir PDFs"):
     else:
         st.warning("Por favor, informe os diretórios.")
 
+parameters = st.slider("Documentos recuperados", min_value=1, max_value=100)
+model_name = st.selectbox("Escolha o modelo de IA", ["llama3.1", "phi 3", "mistral"])
+chunk_size = st.slider("Chunk size", min_value=512, max_value=4096)
+chunk_overlap = st.slider("Chunk overlap", min_value=50, max_value=400)
+prompt = st.text_area("Digite seu prompt")
+
 if st.button("Rodar IA"):
     if prompt:
         docs = load_pdfs_from_directory(output_directory)
-        response = chat_with_model(prompt, model_name, docs, parameters)
+        response = chat_with_model(prompt, model_name, docs, parameters, chunk_size,chunk_overlap)
         st.write("Resposta da IA:")
         st.text(response)
     else:
         st.warning("Por favor, digite um prompt.")
 
-st.write(check_cuda())
-st.info("Recomendamos enviar arquivos já resumidos para melhor desempenho.")
 
 if st.button("Fechar Aplicação"):
     sys.exit()
