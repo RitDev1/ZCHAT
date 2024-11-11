@@ -1,6 +1,5 @@
 import os
 import streamlit as st
-import PyPDF2
 from PyPDF2 import PdfReader, PdfWriter
 import unicodedata
 import re
@@ -15,11 +14,26 @@ from langchain.schema import Document
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
 import textwrap
-import torch
 import subprocess
-import time
 import sys
 import requests
+import json
+from tkinter import Tk, filedialog
+
+CONFIG_FILE = 'directories_config.json'
+
+def load_config():
+    """Carrega os diretórios salvos de um arquivo JSON."""
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, 'r') as file:
+            return json.load(file)
+    return {"input_directory": "", "output_directory": ""}
+
+def save_config(input_directory, output_directory):
+    """Salva os diretórios em um arquivo JSON."""
+    with open(CONFIG_FILE, 'w') as file:
+        json.dump({"input_directory": input_directory, "output_directory": output_directory}, file)
+
 def sanitize_filename(filename):
     """Remove caracteres especiais do nome do arquivo."""
     filename = unicodedata.normalize('NFKD', filename).encode('ASCII', 'ignore').decode('ASCII')
@@ -176,55 +190,78 @@ def download_model(model_name: str):
         st.text(f"Download do modelo {model_name} concluído.")
     except subprocess.CalledProcessError as e:
         st.text(f"Erro ao baixar o modelo {model_name}: {e}")
+# Armazenar histórico de mensagens
+chat_history = []
 
-def chat_with_model(prompt, model_name, docs, parameter, chunk_size,chunk_overlap):
-    if check_model_exists(model_name) == False:
+def chat_with_model(prompt, model_name, docs, parameter, chunk_size, chunk_overlap):
+    if not check_model_exists(model_name):
         download_model(model_name)
+
+    # Carregar embeddings e dividir os documentos
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/paraphrase-multilingual-mpnet-base-v2")
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
     split_documents = text_splitter.split_documents(docs)
     vector_store = FAISS.from_documents(split_documents, embeddings)
     retriever = vector_store.as_retriever(search_kwargs={"k": parameter})
 
+    # Recuperar documentos relevantes
     retrieved_docs = retriever.get_relevant_documents(prompt)
     context = "\n\n".join([f"Documento: {doc.metadata['source']}\n{doc.page_content}" for doc in retrieved_docs])
-    prompt_template = ChatPromptTemplate.from_template(
-        "Você está auxiliando uma pesquisa. Responda com base nos documentos fornecidos.\n\n{context}\n\nPergunta: {input}"
-    )
+
+    # Limitar o histórico a um número razoável de interações, por exemplo, as últimas 5
+    limited_history = chat_history[-10:]  # Ajuste o número conforme necessário
+    formatted_history = "\n".join([f"{msg['role'].capitalize()}: {msg['content']}" for msg in limited_history])
+
+    # Criar o prompt com histórico e contexto
+    full_prompt = f"Você está auxiliando uma pesquisa. Responda a pergunta do usuário com base no contexto apresentado e no histórico de covnersas: \n\nHistórico de conversas:\n{formatted_history}\n\nContexto dos documentos:\n{context}\n\nPergunta do usuário: {prompt}"
+
+    # Criar e rodar a cadeia de LLM
     llm = Ollama(model=model_name)
-    llm_chain = LLMChain(llm=llm, prompt=prompt_template)
-    return llm_chain.run({"context": context, "input": prompt})
+    llm_chain = LLMChain(llm=llm, prompt=ChatPromptTemplate.from_template(full_prompt))
+    response = llm_chain.run({"context": context, "input": prompt})
+
+    # Adicionar a nova interação ao histórico
+    chat_history.append({"role": "user", "content": prompt})
+    chat_history.append({"role": "assistant", "content": response})
+
+    return response
+
 
 # Interface Streamlit
+responses = ''
 st.title("ZCHAT")
+config = load_config()
+with st.sidebar: 
+    input_directory = st.text_input("Diretório de entrada", value=config.get("input_directory", ""))
+    output_directory = st.text_input("Diretório de saída", value=config.get("output_directory", ""))
 
-input_directory = st.text_input("Diretório de entrada")
-output_directory = st.text_input("Diretório de saída")
-model_name = st.selectbox("Escolha o modelo de IA", ["llama3.1", "phi 3", "mistral"])
+    if st.button("Salvar diretórios"):
+        save_config(input_directory, output_directory)
 
-if st.button("Resumir PDFs"):
-    
-    if input_directory and output_directory:
-        process_pdfs(input_directory, output_directory, model_name)
-    else:
-        st.warning("Por favor, informe os diretórios.")
+    model_name = st.selectbox("Escolha o modelo de IA", ["llama3.1", "phi3", "mistral"])
 
-parameters = st.slider("Documentos recuperados", min_value=1, max_value=100, value=10)
-mostrar_avançadas = st.checkbox("Mostrar configurações avançadas")
-if mostrar_avançadas: 
-    chunk_size = st.slider("Chunk size", min_value=512, max_value=4096, value=1024)
-    chunk_overlap = st.slider("Chunk overlap", min_value=50, max_value=400,value=100)
-prompt = st.text_area("Digite seu prompt")
+    if st.button("Resumir PDFs"):
+        
+        if input_directory and output_directory:
+            process_pdfs(input_directory, output_directory, model_name)
+        else:
+            st.warning("Por favor, informe os diretórios.")
 
-if st.button("Rodar IA"):
-    if prompt:
-        docs = load_pdfs_from_directory(output_directory)
-        response = chat_with_model(prompt, model_name, docs, parameters, chunk_size,chunk_overlap)
-        st.write("Resposta da IA:")
-        st.text(response)
-    else:
-        st.warning("Por favor, digite um prompt.")
+    parameters = st.slider("Documentos recuperados", min_value=1, max_value=100, value=10)
 
+    with st.expander("Configurações Avançadas"): 
+        chunk_size = st.slider("Chunk size", min_value=512, max_value=4096, value=1024)
+        chunk_overlap = st.slider("Chunk overlap", min_value=50, max_value=400,value=100)
+
+
+messages = st.container(height=300)
+prompt = st.chat_input("Digite seu prompt")
+if prompt: 
+    messages.chat_message("usuário").write(prompt)
+    docs = load_pdfs_from_directory(output_directory)
+    response = chat_with_model(prompt, model_name, docs, parameters, chunk_size,chunk_overlap)
+    st.write("Resposta da IA:")
+    messages.chat_message("ZCHAT").write(response)
 
 if st.button("Fechar Aplicação"):
     sys.exit()
