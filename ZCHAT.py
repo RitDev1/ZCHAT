@@ -15,10 +15,9 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
 import textwrap
 import subprocess
-import sys
-import requests
 import json
-from tkinter import Tk, filedialog
+from langchain.memory import ConversationBufferMemory
+
 
 CONFIG_FILE = 'directories_config.json'
 
@@ -33,6 +32,44 @@ def save_config(input_directory, output_directory):
     """Salva os diretórios em um arquivo JSON."""
     with open(CONFIG_FILE, 'w') as file:
         json.dump({"input_directory": input_directory, "output_directory": output_directory}, file)
+
+def save_chat_history_to_json(memory, output_path="chat_history.json"):
+    """Salva o histórico de mensagens como um arquivo JSON."""
+    chat_history = []
+    for message in memory.chat_memory.messages:
+        if message.type == "human":
+            chat_history.append({"role": "user", "content": message.content})
+        elif message.type == "ai":
+            chat_history.append({"role": "assistant", "content": message.content})
+
+    with open(output_path, "w") as f:
+        json.dump(chat_history, f, ensure_ascii=False, indent=4)
+
+    st.text(f"Histórico de mensagens salvo em {output_path}")
+
+def load_chat_history_from_json(memory, input_path="chat_history.json"):
+    """Carrega um histórico de mensagens de um arquivo JSON e restaura na memória."""
+    if os.path.exists(input_path):
+        with open(input_path, "r") as f:
+            chat_history = json.load(f)
+
+        # Limpa o histórico atual
+        memory.chat_memory.clear()
+
+        # Restaura o histórico de mensagens
+        for msg in chat_history:
+            if msg["role"] == "user":
+                memory.chat_memory.add_user_message(msg["content"])
+            elif msg["role"] == "assistant":
+                memory.chat_memory.add_ai_message(msg["content"])
+
+        st.text(f"Histórico de mensagens carregado de {input_path}")
+    else:
+        st.warning(f"O arquivo {input_path} não foi encontrado.")
+
+
+    with open(input_path, "w") as f:
+        json.dump(chat_history, f, ensure_ascii=False, indent=4)
 
 def sanitize_filename(filename):
     """Remove caracteres especiais do nome do arquivo."""
@@ -52,7 +89,7 @@ def split_text_into_chunks(text, chunk_size=5000, overlap=100):
 from langchain.prompts.chat import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
 
 def generate_summary_llm(text, model):
-    """Gera um resumo do PDF utilizando a chain `summarize` do LangChain com prompt personalizado."""
+    """Gera um resumo do PDF utilizando a chain summarize do LangChain com prompt personalizado."""
     llm = Ollama(model=model)  # Define o modelo LLM
 
     # Prompt personalizado para a etapa MAP (resumo de trechos)
@@ -156,8 +193,6 @@ def create_pdf_with_abstract_or_summary(input_path, output_directory, model):
         st.text(f"Novo PDF criado: {output_path}")
 
 def process_pdfs(input_directory, output_directory, model):
-    if check_model_exists(model_name) == False:
-        download_model(model_name)
     for filename in os.listdir(input_directory):
         if filename.endswith('.pdf'):
             input_path = os.path.join(input_directory, filename)
@@ -177,11 +212,13 @@ def load_pdfs_from_directory(directory):
 
 def check_model_exists(model_name: str) -> bool:
     try:
-        response = requests.get(f"http://localhost:11434/models/{model_name}")
-        return response.status_code == 200
-    except requests.ConnectionError:
-        print("Erro: Não foi possível conectar ao serviço Ollama.")
+        result = subprocess.run(["ollama", "list"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        installed_models = [line.strip() for line in result.stdout.strip().split('\n') if line.strip()]
+        return model_name in installed_models
+    except subprocess.CalledProcessError as e:
+        st.text(f"Erro ao executar 'ollama list': {e}")
         return False
+
 
 def download_model(model_name: str):
     try:
@@ -191,46 +228,73 @@ def download_model(model_name: str):
     except subprocess.CalledProcessError as e:
         st.text(f"Erro ao baixar o modelo {model_name}: {e}")
 # Armazenar histórico de mensagens
-chat_history = []
 
-def chat_with_model(prompt, model_name, docs, parameter, chunk_size, chunk_overlap):
-    if not check_model_exists(model_name):
-        download_model(model_name)
+memory = ConversationBufferMemory()
+def chat_without_rag(prompt, model_name, memory):
+    memory.chat_memory.add_user_message(prompt)
 
-    # Carregar embeddings e dividir os documentos
+    # Constrói o prompt considerando o histórico da memória
+    full_prompt = f"Contexto da conversa:\n{memory.load_memory_variables({})['history']}\n\nPergunta do usuário: {prompt}"
+
+    # Gera resposta com o modelo
+    llm = Ollama(model=model_name)
+    response = llm.predict(full_prompt)
+    
+    # Adiciona a resposta do modelo à memória
+    memory.chat_memory.add_ai_message(response)
+
+    return response
+
+def chat_with_model(prompt, model_name, docs, parameter, chunk_size, chunk_overlap, memory):
+    # Load embeddings and split documents
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/paraphrase-multilingual-mpnet-base-v2")
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
     split_documents = text_splitter.split_documents(docs)
     vector_store = FAISS.from_documents(split_documents, embeddings)
     retriever = vector_store.as_retriever(search_kwargs={"k": parameter})
 
-    # Recuperar documentos relevantes
+    # Retrieve relevant documents
     retrieved_docs = retriever.get_relevant_documents(prompt)
     context = "\n\n".join([f"Documento: {doc.metadata['source']}\n{doc.page_content}" for doc in retrieved_docs])
 
-    # Limitar o histórico a um número razoável de interações, por exemplo, as últimas 5
-    limited_history = chat_history[-10:]  # Ajuste o número conforme necessário
-    formatted_history = "\n".join([f"{msg['role'].capitalize()}: {msg['content']}" for msg in limited_history])
+    # Load history from memory
+    history = memory.load_memory_variables({})['history']
 
-    # Criar o prompt com histórico e contexto
-    full_prompt = f"Você está auxiliando uma pesquisa. Responda a pergunta do usuário com base no contexto apresentado e no histórico de covnersas: \n\nHistórico de conversas:\n{formatted_history}\n\nContexto dos documentos:\n{context}\n\nPergunta do usuário: {prompt}"
+    # Define the prompt template with placeholders
+    full_prompt_template = (
+        "Você está auxiliando uma pesquisa. Responda à pergunta do usuário com base no histórico da conversa e nos documentos enviados.\n\n"
+        "Contexto dos documentos:\n{context}\n\n"
+        "Histórico da conversa:\n{history}\n\n"
+        "Pergunta do usuário: {user_prompt}"
+    )
 
-    # Criar e rodar a cadeia de LLM
+    # Set up the prompt template with the full context
+    prompt_template = ChatPromptTemplate.from_template(full_prompt_template)
+
+    # Create the LLMChain with the prompt template
     llm = Ollama(model=model_name)
-    llm_chain = LLMChain(llm=llm, prompt=ChatPromptTemplate.from_template(full_prompt))
-    response = llm_chain.run({"context": context, "input": prompt})
+    llm_chain = LLMChain(llm=llm, prompt=prompt_template)
 
-    # Adicionar a nova interação ao histórico
-    chat_history.append({"role": "user", "content": prompt})
-    chat_history.append({"role": "assistant", "content": response})
+    # Run the chain with the variables, explicitly setting all needed variables
+    response = llm_chain.run({
+        "history": history,  # Ensure history is passed correctly
+        "context": context,
+        "user_prompt": prompt
+    })
+
+    # Add the user's message and the AI's response to memory
+    memory.chat_memory.add_user_message(prompt)
+    memory.chat_memory.add_ai_message(response)
 
     return response
-
-
 # Interface Streamlit
 responses = ''
 st.title("ZCHAT")
 config = load_config()
+
+if "memory" not in st.session_state:
+    st.session_state.memory = ConversationBufferMemory()
+
 with st.sidebar: 
     input_directory = st.text_input("Diretório de entrada", value=config.get("input_directory", ""))
     output_directory = st.text_input("Diretório de saída", value=config.get("output_directory", ""))
@@ -238,8 +302,10 @@ with st.sidebar:
     if st.button("Salvar diretórios"):
         save_config(input_directory, output_directory)
 
-    model_name = st.selectbox("Escolha o modelo de IA", ["llama3.1", "phi3", "mistral"])
-
+    model_name = st.selectbox("Escolha o modelo de IA", ["llama3.1", "phi3", "mistral", "qwen2.5-coder:7b", "qwen2.5-coder:14b"])
+    if st.button("Baixar LLM"):
+        download_model(model_name)
+        
     if st.button("Resumir PDFs"):
         
         if input_directory and output_directory:
@@ -252,16 +318,33 @@ with st.sidebar:
     with st.expander("Configurações Avançadas"): 
         chunk_size = st.slider("Chunk size", min_value=512, max_value=4096, value=1024)
         chunk_overlap = st.slider("Chunk overlap", min_value=50, max_value=400,value=100)
+    if st.button("Salvar Conversa"): 
+        save_chat_history_to_json(st.session_state.memory)
 
 
-messages = st.container(height=300)
+    if st.button("Carregar Histórico"):
+        load_chat_history_from_json(st.session_state.memory)
+
+
+messages = st.container(height=450)
 prompt = st.chat_input("Digite seu prompt")
-if prompt: 
-    messages.chat_message("usuário").write(prompt)
-    docs = load_pdfs_from_directory(output_directory)
-    response = chat_with_model(prompt, model_name, docs, parameters, chunk_size,chunk_overlap)
-    st.write("Resposta da IA:")
-    messages.chat_message("ZCHAT").write(response)
+usar_rag = st.checkbox("Usar RAG")
 
-if st.button("Fechar Aplicação"):
-    sys.exit()
+st.write("Histórico da Conversa:")
+for message in st.session_state.memory.chat_memory.messages:
+    if message.type == "human":
+        messages.chat_message("usuário").write(message.content)
+    elif message.type == "ai":
+         messages.chat_message("ZCHAT").write(message.content)
+
+if prompt:
+    if usar_rag: 
+        messages.chat_message("usuário").write(prompt)
+        docs = load_pdfs_from_directory(output_directory)
+        response = chat_with_model(prompt, model_name, docs, parameters, chunk_size,chunk_overlap,st.session_state.memory)
+        messages.chat_message("ZCHAT").write(response)
+    else: 
+        messages.chat_message("usuário").write(prompt)
+        response = chat_without_rag(prompt, model_name,st.session_state.memory)
+        messages.chat_message("ZCHAT").write(response)
+
